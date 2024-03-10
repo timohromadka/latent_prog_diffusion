@@ -1,0 +1,57 @@
+# use this to see all:
+# find . -name "*.yaml" -exec echo {} \; -exec cat {} \; -exec echo -e "\n\n" \;
+
+defaults:
+  - model@models.unet: small_native # diffusers_native
+  - data: cifar10
+  - scheduler@training.scheduler: ddpm
+  - scheduler@inference.scheduler: ddpm
+  - logger: wandb
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: ./
+
+resume_from_checkpoint: null
+
+pl_trainer:
+  accelerator: gpu
+  num_nodes: 1
+  benchmark: true
+  precision: "16-mixed"
+  strategy: ddp
+  num_sanity_val_steps: 0
+  max_epochs: ${training.epochs}
+  enable_model_summary: true
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 10
+  devices: -1
+
+models:
+  unet:
+    sample_size: 32
+
+data:
+  batch_size: ${training.batch_size}
+  # dataset specific
+  image_resolution: 32
+  data_dir: cifar10
+  HF_DATASET_IMAGE_KEY: "img"
+
+inference:
+  num_samples: 1024 # or 50,000
+  scheduler:
+    clip_sample: true
+  pipeline_kwargs:
+    batch_size: 64
+    num_inference_steps: 1000
+
+training:
+  batch_size: 32
+  learning_rate: 1.e-4
+  epochs: 3000
+  ema_decay: 0.9999 # `-1` disables it

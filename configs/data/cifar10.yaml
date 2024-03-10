@@ -1,0 +1,2 @@
+data_dir: cifar10
+HF_DATASET_IMAGE_KEY: "img"
