@@ -1,7 +1,8 @@
 import hydra as hy
 from omegaconf import DictConfig, OmegaConf
 
-import torch as th
+import torch
+from torchvision import transforms, utils as tv_utils
 from lightning.pytorch import callbacks, Trainer, LightningModule
 
 from utils import (
@@ -14,7 +15,7 @@ from dm import ImageDatasets
 from models.models import Diffusion
 
 # some global stuff necessary for the program
-th.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision('medium')
 to_tensor = transforms.ToTensor()
 
 
@@ -22,7 +23,8 @@ to_tensor = transforms.ToTensor()
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)  # resolve all string interpolation
 
-    system = Diffusion(cfg.models, cfg.training, cfg.inference)
+    
+    model = Diffusion(cfg.models, cfg.training, cfg.inference)
     datamodule = ImageDatasets(cfg.data)
 
     trainer = Trainer(
@@ -35,7 +37,7 @@ def main(cfg: DictConfig):
         logger=hy.utils.instantiate(cfg.logger, _recursive_=True),
         **cfg.pl_trainer
     )
-    trainer.fit(system, datamodule=datamodule,
+    trainer.fit(model, datamodule=datamodule,
                 ckpt_path=cfg.resume_from_checkpoint
                 )
 
