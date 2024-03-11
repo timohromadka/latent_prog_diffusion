@@ -6,12 +6,18 @@ from itertools import chain
 from contextlib import contextmanager, nullcontext
 from lightning.pytorch import callbacks, Trainer, LightningModule
 from omegaconf import DictConfig, OmegaConf
+from pl_bolts.models.autoencoders.components import (
+    resnet18_decoder,
+    resnet18_encoder,
+)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_ema import ExponentialMovingAverage as EMA
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torch.optim import Adam
 from torchvision import transforms, utils as tv_utils
+from torchvision.models import vgg16
 
 from diffusers import DDPMPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -227,60 +233,148 @@ class Diffusion(LightningModule):
         }
         
         
+# =====================
+# VAE from GitHub
+# https://github.com/williamFalcon/pytorch-lightning-vae/blob/main/vae.py
+# =====================
+class VAE(LightningModule):
+    def __init__(self, enc_out_dim=512, latent_dim=256, input_height=32):
+        super().__init__()
+
+        self.save_hyperparameters()
+
+        # encoder, decoder
+        self.encoder = resnet18_encoder(False, False)
+        self.decoder = resnet18_decoder(
+            latent_dim=latent_dim,
+            input_height=input_height,
+            first_conv=False,
+            maxpool1=False
+        )
+
+        # distribution parameters
+        self.fc_mu = nn.Linear(enc_out_dim, latent_dim)
+        self.fc_var = nn.Linear(enc_out_dim, latent_dim)
+
+        # for the gaussian likelihood
+        self.log_scale = nn.Parameter(torch.Tensor([0.0]))
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-4)
+
+    def gaussian_likelihood(self, x_hat, logscale, x):
+        scale = torch.exp(logscale)
+        mean = x_hat
+        dist = torch.distributions.Normal(mean, scale)
+
+        # measure prob of seeing image under p(x|z)
+        log_pxz = dist.log_prob(x)
+        return log_pxz.sum(dim=(1, 2, 3))
+
+    def kl_divergence(self, z, mu, std):
+        # --------------------------
+        # Monte carlo KL divergence
+        # --------------------------
+        # 1. define the first two probabilities (in this case Normal for both)
+        p = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(std))
+        q = torch.distributions.Normal(mu, std)
+
+        # 2. get the probabilities from the equation
+        log_qzx = q.log_prob(z)
+        log_pz = p.log_prob(z)
+
+        # kl
+        kl = (log_qzx - log_pz)
+        kl = kl.sum(-1)
+        return kl
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+
+        # encode x to get the mu and variance parameters
+        x_encoded = self.encoder(x)
+        mu, log_var = self.fc_mu(x_encoded), self.fc_var(x_encoded)
+
+        # sample z from q
+        std = torch.exp(log_var / 2)
+        q = torch.distributions.Normal(mu, std)
+        z = q.rsample()
+
+        # decoded
+        x_hat = self.decoder(z)
+
+        # reconstruction loss
+        recon_loss = self.gaussian_likelihood(x_hat, self.log_scale, x)
+
+        # kl
+        kl = self.kl_divergence(z, mu, std)
+
+        # elbo
+        elbo = (kl - recon_loss)
+        elbo = elbo.mean()
+
+        self.log_dict({
+            'elbo': elbo,
+            'kl': kl.mean(),
+            'recon_loss': recon_loss.mean(),
+            'reconstruction': recon_loss.mean(),
+            'kl': kl.mean(),
+        })
+
+        return elbo
         
 # =====================
-# VAE
+# Custom VAE
 # =====================
-class Encoder(nn.Module):
-    def __init__(self, input_channels=3, latent_dim=256):
-        super().__init__()
-        self.conv1 = nn.Conv2d(input_channels, 32, 4, 2, 1) # Output: (32, 64, 64)
-        self.conv2 = nn.Conv2d(32, 64, 4, 2, 1) # Output: (64, 32, 32)
-        self.conv3 = nn.Conv2d(64, 128, 4, 2, 1) # Output: (128, 16, 16)
-        self.conv4 = nn.Conv2d(128, 256, 4, 2, 1) # Output: (256, 8, 8)
-        self.fc_mu = nn.Linear(256*8*8, latent_dim)
-        self.fc_log_var = nn.Linear(256*8*8, latent_dim)
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = x.view(x.size(0), -1)
-        mu = self.fc_mu(x)
-        log_var = self.fc_log_var(x)
-        return mu, log_var
+# class Encoder(nn.Module):
+#     def __init__(self, input_channels=3, latent_dim=2):  # Change for 2D latent space
+#         super().__init__()
+#         self.conv1 = nn.Sequential(nn.Conv2d(input_channels, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU())  # Added BatchNorm
+#         self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU())
+#         self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU())
+#         self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.ReLU())
+#         self.fc_mu = nn.Linear(256*8*8, latent_dim)
+#         self.fc_log_var = nn.Linear(256*8*8, latent_dim)
 
-class Decoder(nn.Module):
-    def __init__(self, output_channels=3, latent_dim=256):
-        super().__init__()
-        self.fc = nn.Linear(latent_dim, 256*8*8)
-        self.conv1 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
-        self.conv2 = nn.ConvTranspose2d(128, 64, 4, 2, 1)
-        self.conv3 = nn.ConvTranspose2d(64, 32, 4, 2, 1)
-        self.conv4 = nn.ConvTranspose2d(32, output_channels, 4, 2, 1)
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = self.conv2(x)
+#         x = self.conv3(x)
+#         x = self.conv4(x)
+#         x = x.view(x.size(0), -1)
+#         mu = self.fc_mu(x)
+#         log_var = self.fc_log_var(x)
+#         return mu, log_var
 
-    def forward(self, z):
-        z = self.fc(z)
-        z = z.view(-1, 256, 8, 8)
-        z = F.relu(self.conv1(z))
-        z = F.relu(self.conv2(z))
-        z = F.relu(self.conv3(z))
-        z = torch.sigmoid(self.conv4(z)) # Assuming images are normalized to [0,1]
-        return z
+# class Decoder(nn.Module):
+#     def __init__(self, output_channels=3, latent_dim=2):  # Change for 2D latent space
+#         super().__init__()
+#         self.fc = nn.Linear(latent_dim, 256*8*8)
+#         self.deconv1 = nn.Sequential(nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU())
+#         self.deconv2 = nn.Sequential(nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU())
+#         self.deconv3 = nn.Sequential(nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU())
+#         self.deconv4 = nn.ConvTranspose2d(32, output_channels, 4, 2, 1)
 
-# TODO
-# incorporate perceptual loss
-# adapt to 2d latent space
-# adversarial objective
-# regulirzation
-class VAE(LightningModule):
-    def __init__(self, input_channels=3, latent_dim=256, learning_rate=1e-3):
+#     def forward(self, z):
+#         z = self.fc(z)
+#         z = z.view(-1, 256, 8, 8)
+#         z = self.deconv1(z)
+#         z = self.deconv2(z)
+#         z = self.deconv3(z)
+#         z = torch.sigmoid(self.deconv4(z))  # Assuming images are normalized to [0,1]
+#         return z
+
+# class VAE(LightningModule):
+    def __init__(self, input_channels=3, latent_dim=2, learning_rate=1e-3):  # Change for 2D latent space
         super().__init__()
         self.encoder = Encoder(input_channels, latent_dim)
         self.decoder = Decoder(input_channels, latent_dim)
         self.latent_dim = latent_dim
         self.learning_rate = learning_rate
+        self.vgg = vgg16(pretrained=True).features[:11].eval()  # For perceptual loss, uses up to ReLU3_1
+        for param in self.vgg.parameters():
+            param.requires_grad = False
 
     def forward(self, x):
         mu, log_var = self.encoder(x)
@@ -292,15 +386,29 @@ class VAE(LightningModule):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def perceptual_loss(self, recon_x, x):
+        vgg_recon = self.vgg(recon_x)
+        vgg_x = self.vgg(x)
+        return F.mse_loss(vgg_recon, vgg_x)
+
     def training_step(self, batch, batch_idx):
         x, _ = batch
         recon_x, mu, log_var = self.forward(x)
         recon_loss = F.mse_loss(recon_x, x, reduction="mean")
+        perceptual_loss = self.perceptual_loss(recon_x, x)  # Perceptual loss component
         kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        loss = recon_loss + kld_loss
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        loss = recon_loss + kld_loss + perceptual_loss
+        self.log_dict({"train_loss": loss, "recon_loss": recon_loss, "kld_loss": kld_loss, "perceptual_loss": perceptual_loss}, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        x, _ = batch
+        recon_x, mu, log_var = self.forward(x)
+        recon_loss = F.mse_loss(recon_x, x, reduction="mean")
+        perceptual_loss = self.perceptual_loss(recon_x, x)
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        loss = recon_loss + kld_loss + perceptual_loss
+        self.log_dict({"val_loss": loss, "val_recon_loss": recon_loss, "val_kld_loss": kld_loss, "val_perceptual_loss": perceptual_loss}, on_step=False, on_epoch=True, prog_bar=True)
+
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
+        return Adam(self.parameters(), lr=self.learning_rate)
