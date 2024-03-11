@@ -1,9 +1,14 @@
+import argparse
+import copy
+import logging
+import glob
 import hydra as hy
 import math
 import os
 from itertools import chain
 
 from contextlib import contextmanager, nullcontext
+from diffusers import DDPMScheduler, DDIMScheduler, UNet2DModel
 from lightning.pytorch import callbacks, Trainer, LightningModule
 from omegaconf import DictConfig, OmegaConf
 from pl_bolts.models.autoencoders.components import (
@@ -14,42 +19,173 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_ema import ExponentialMovingAverage as EMA
+from torchmetrics import MetricCollection, MeanSquaredError
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torch.optim import Adam
 from torchvision import transforms, utils as tv_utils
+from torchvision.utils import save_image
 from torchvision.models import vgg16
 
 from diffusers import DDPMPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
+from .vqvae import VQVAE
+
 from utils import (
     PipelineCheckpoint,
-    _fix_hydra_config_serialization,
     ConfigMixin
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('models/models.py')
 
 torch.set_float32_matmul_precision('medium')
 to_tensor = transforms.ToTensor()
 
+def generate_images_from_latent_codes(model, device, num_samples=10, image_size=32, save_path="generated_images.png"):
+    # Assuming your latent space size is the same as the CIFAR10 images you trained on
+    latent_dims = (image_size // (2 ** model.num_downsampling_layers)) ** 2  # Adjust based on your architecture's downsampling
+    # Sample random latent codes
+    sampled_latent_codes = torch.randint(0, model.vq.num_embeddings, (num_samples, latent_dims)).to(device)
+    # Convert latent codes to one-hot embeddings
+    one_hot = torch.nn.functional.one_hot(sampled_latent_codes, num_classes=model.vq.num_embeddings).float()
+    # Reshape to match the decoder input
+    one_hot = one_hot.permute(0, 3, 1, 2).reshape(num_samples, model.embedding_dim, image_size // (2 ** model.num_downsampling_layers), image_size // (2 ** model.num_downsampling_layers))
+    # Decode images
+    with torch.no_grad():
+        generated_images = model.decoder(one_hot)
+    # Normalize and save images
+    generated_images = (generated_images + 1) / 2  # Assuming your model output is in [-1, 1]
+    save_image(generated_images, save_path, nrow=int(num_samples ** 0.5), normalize=True)
+
+
+def get_model(args: argparse.Namespace):
+    if args.model_to_load is None:
+        if args.model in ['diffusion', 'latent_diffusion']:
+            return Diffusion(args)
+        elif args.model == 'vae':
+            return VQVAELightning(args)
+    else:
+        load_model_from_run_name(args)
+        
+def load_model_from_run_name(args):
+    """
+    Load a model from a given checkpoint path.
+    
+    Args:
+    - teacher_run_name (str): Run name of the teacher model.
+    - args: Arguments needed to initialize the model architecture.
+    
+    Returns:
+    - Loaded model.
+    """
+    logger.info(f'Loading, configuring, and initializing teacher model from checkpoint using run name: {args.run_name_to_load}')
+    
+    teacher_model_path = os.path.join(args.checkpoint_dir, args.run_name_to_load)
+    
+    if not os.path.exists(teacher_model_path):
+        raise FileNotFoundError(f"Directory not found at {teacher_model_path}")
+
+    checkpoint_files = glob.glob(os.path.join(teacher_model_path, '*.ckpt'))
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No .ckpt files found in {teacher_model_path}")
+
+    # There should only be one, if not, we only grab the first one for simplicity
+    checkpoint_path = checkpoint_files[0]
+
+    # Load the checkpoint to access the configuration
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    config = checkpoint.get('config')
+    config_dict = vars(config)
+
+    if not config:
+        raise ValueError(f"No config found in checkpoint at {checkpoint_path}")
+    
+    model_args = copy.deepcopy(args)
+    
+    # dynamically copy all arguments from config to teacher_args
+    # this is needed to ensure we can properly load and use the model for inference correctly
+    for key, value in vars(config).items():
+        setattr(model_args, key, value)
+
+    if model_args.model in ['diffusion', 'latent_diffusion']:
+        model_type = Diffusion
+    elif model_args.model == 'vae':
+        model_type =  VQVAELightning
+    else:
+        raise ValueError(f"Unsupported model type: {model_args.model}")
+
+    model = model_type.load_from_checkpoint(checkpoint_path, args=model_args)
+
+    return model, model_args    
+  
+  
+class VQVAELightning(LightningModule):
+    def __init__(self, args, lr=3e-4):
+        super().__init__()
+        self.save_hyperparameters()  # Save initialization arguments to log them with TensorBoard or access them later.
+        
+        # Model setup
+        self.model = VQVAE(args)
+        self.criterion = torch.nn.MSELoss()
+        self.beta = args.beta
+        self.lr = lr  # Using the passed lr argument or default value.
+
+        # Metrics
+        self.metrics = MetricCollection({
+            "mse": MeanSquaredError(),
+        })
+
+    def forward(self, x):
+        return self.model(x)
+
+    def step(self, batch):
+        imgs = batch['images']
+        out = self.model(imgs)
+        recon_error = self.criterion(out["x_recon"], imgs)
+        commitment_loss = self.beta * out["commitment_loss"]
+        dictionary_loss = out.get("dictionary_loss", 0)  # This accounts for models not using EMA.
+        
+        total_loss = recon_error + commitment_loss + dictionary_loss
+        return total_loss, recon_error, commitment_loss, dictionary_loss
+
+    def training_step(self, batch, batch_idx):
+        total_loss, recon_error, commitment_loss, dictionary_loss = self.step(batch)
+        
+        # Log individual losses
+        self.log('train_recon_error', recon_error)
+        self.log('train_commitment_loss', commitment_loss)
+        self.log('train_dictionary_loss', dictionary_loss)
+        self.log('train_total_loss', total_loss)
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        total_loss, recon_error, commitment_loss, dictionary_loss = self.step(batch)
+        
+        # Log individual losses
+        self.log('val_recon_error', recon_error)
+        self.log('val_commitment_loss', commitment_loss)
+        self.log('val_dictionary_loss', dictionary_loss)
+        self.log('val_total_loss', total_loss)
+
+        return total_loss
+
+    def configure_optimizers(self):
+        optimizer = Adam(self.parameters(), lr=self.lr)
+        return optimizer
+
 class Diffusion(LightningModule):
-    def __init__(self,
-                 models_cfg: DictConfig,
-                 training_cfg: DictConfig,
-                 inference_cfg: DictConfig
-                 ):
+    def __init__(self, args: argparse.Namespace):
         super().__init__()
 
-        self.training_cfg = training_cfg
-        self.inference_cfg = inference_cfg
-
-        self.model = hy.utils.instantiate(models_cfg.unet)
-        self.train_scheduler = \
-            hy.utils.instantiate(self.training_cfg.scheduler)
-        self.infer_scheduler = \
-            hy.utils.instantiate(self.inference_cfg.scheduler)
-
+        self.args = args
+        self.model = self._create_unet_model(args.model_size)
+        self.train_scheduler = self._create_scheduler(args, args.train_scheduler)
+        self.infer_scheduler = self._create_scheduler(args, args.infer_scheduler)
+        
         self.ema = \
-            EMA(self.model.parameters(), decay=self.training_cfg.ema_decay) \
+            EMA(self.model.parameters(), decay=self.args.ema_decay) \
             if self.ema_wanted else None
 
         self._fid = FrechetInceptionDistance(
@@ -59,6 +195,88 @@ class Diffusion(LightningModule):
 
         self.save_hyperparameters()
 
+    def _create_scheduler(self, args, scheduler_type):
+        scheduler_kwargs = {
+            "num_train_timesteps": args.num_train_timesteps,
+            "beta_start": args.beta_start,
+            "beta_end": args.beta_end,
+            "beta_schedule": args.beta_schedule,
+            "trained_betas": None,
+            "variance_type": args.variance_type,
+            "clip_sample": args.clip_sample,
+            "prediction_type": args.prediction_type,
+            "thresholding": args.thresholding,
+            "dynamic_thresholding_ratio": args.dynamic_thresholding_ratio,
+            "clip_sample_range": args.clip_sample_range,
+            "sample_max_value": args.sample_max_value,
+            "timestep_spacing": args.timestep_spacing,
+            "steps_offset": args.steps_offset,
+            "rescale_betas_zero_snr": args.rescale_betas_zero_snr
+        }
+        
+        if scheduler_type == 'ddpm':
+            return DDPMScheduler(**scheduler_kwargs)
+        elif scheduler_type == 'ddim':
+            return DDIMScheduler(**scheduler_kwargs)
+        else:
+            raise ValueError(f"Unsupported scheduler type: {args.scheduler_type}")
+
+    def _create_unet_model(self, model_size):
+        if model_size == 'large':
+            model = UNet2DModel(
+                sample_size=32,
+                in_channels=3,
+                out_channels=3,
+                center_input_sample=False,
+                time_embedding_type="positional",
+                freq_shift=0,
+                flip_sin_to_cos=True,
+                down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
+                up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
+                block_out_channels=(128, 128, 256, 256, 512, 512),
+                layers_per_block=2,
+                mid_block_scale_factor=1,
+                downsample_padding=1,
+                downsample_type="conv",
+                upsample_type="conv",
+                dropout=0.0,
+                act_fn="silu",
+                attention_head_dim=8,
+                norm_num_groups=32,
+                norm_eps=1e-05,
+                add_attention=True,
+                resnet_time_scale_shift="default"
+            )
+        elif model_size == 'small':
+            model = UNet2DModel(
+                sample_size=16,
+                in_channels=3,
+                out_channels=3,
+                center_input_sample=False,
+                time_embedding_type="positional",
+                freq_shift=0,
+                flip_sin_to_cos=True,
+                down_block_types=("DownBlock2D", "AttnDownBlock2D"),
+                up_block_types=("AttnUpBlock2D", "UpBlock2D"),
+                block_out_channels=(112, 224),
+                layers_per_block=1,
+                mid_block_scale_factor=1,
+                downsample_padding=1,
+                downsample_type="conv",
+                upsample_type="conv",
+                dropout=0.0,
+                act_fn="silu",
+                attention_head_dim=8,
+                norm_num_groups=16,
+                norm_eps=1e-05,
+                add_attention=True,
+                resnet_time_scale_shift="default"
+            )
+        else:
+            raise ValueError("Unsupported model size. Choose 'small' or 'large'.")
+
+        return model
+    
     @contextmanager
     def metrics(self):
         self._fid.reset()
@@ -71,12 +289,7 @@ class Diffusion(LightningModule):
 
     @property
     def ema_wanted(self):
-        return self.training_cfg.ema_decay != -1
-
-    def _fix_hydra_config_serialization(self) -> None:
-        for child in chain(self.children(), vars(self).values()):
-            if isinstance(child, ConfigMixin):
-                _fix_hydra_config_serialization(child)
+        return self.args.ema_decay != -1
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         if self.ema_wanted:
@@ -94,7 +307,7 @@ class Diffusion(LightningModule):
         return super().on_before_zero_grad(optimizer)
 
     def to(self, *args, **kwargs):
-        if self.training_cfg.ema_decay != -1:
+        if self.args.ema_decay != -1:
             self.ema.to(*args, **kwargs)
         return super().to(*args, **kwargs)
 
@@ -165,7 +378,7 @@ class Diffusion(LightningModule):
     
     def calculate_and_log_fid(self):
         # Generate images for FID calculation
-        pil_images = self.sample(batch_size=self.inference_cfg.fid_batch_size, num_samples=self.inference_cfg.num_fid_samples)
+        pil_images = self.sample(batch_size=self.args.batch_size, num_samples=self.args.num_fid_samples)
         self.record_fake_data_for_FID(pil_images)
         
         # Here, you should ensure that real images are already recorded or record them as needed.
@@ -184,18 +397,16 @@ class Diffusion(LightningModule):
         return pipe
 
     def save_pretrained(self, path: str, push_to_hub: bool = False):
-        self._fix_hydra_config_serialization()
-
         pipe = self.pipeline()
         pipe.save_pretrained(path, safe_serialization=True,
                              push_to_hub=push_to_hub)
 
     def on_validation_epoch_end(self) -> None:
-        batch_size = self.inference_cfg.pipeline_kwargs.get(
-            'batch_size', self.training_cfg.batch_size * 2)
+        batch_size = self.args.pipeline_kwargs.get(
+            'batch_size', self.args.batch_size * 2)
 
         n_per_rank = math.ceil(
-            self.inference_cfg.num_samples / self.trainer.world_size)
+            self.args.num_samples / self.trainer.world_size)
         n_batches_per_rank = math.ceil(
             n_per_rank / batch_size)
 
@@ -203,7 +414,7 @@ class Diffusion(LightningModule):
         with self.metrics():
             for _ in range(n_batches_per_rank):
                 pil_images = self.sample(
-                    **self.inference_cfg.pipeline_kwargs
+                    **self.args.pipeline_kwargs
                 )
                 self.record_fake_data_for_FID(pil_images)
 
@@ -225,7 +436,7 @@ class Diffusion(LightningModule):
 
     def configure_optimizers(self):
         optim = torch.optim.AdamW(
-            self.parameters(), lr=self.training_cfg.learning_rate)
+            self.parameters(), lr=self.args.learning_rate)
         sched = torch.optim.lr_scheduler.StepLR(optim, 1, gamma=0.99)
         return {
             'optimizer': optim,
@@ -240,7 +451,6 @@ class Diffusion(LightningModule):
 class VAE(LightningModule):
     def __init__(self, enc_out_dim=512, latent_dim=256, input_height=32):
         super().__init__()
-
         self.save_hyperparameters()
 
         # encoder, decoder
@@ -322,93 +532,307 @@ class VAE(LightningModule):
         })
 
         return elbo
+    
+
+# =====================
+# Lightweight VQ-VAE
+# =====================       
+
         
 # =====================
 # Custom VAE
 # =====================
-
 # class Encoder(nn.Module):
-#     def __init__(self, input_channels=3, latent_dim=2):  # Change for 2D latent space
+#     def __init__(self, input_channels, image_size, compression_rate, latent_dim):
 #         super().__init__()
-#         self.conv1 = nn.Sequential(nn.Conv2d(input_channels, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU())  # Added BatchNorm
-#         self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU())
-#         self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU())
-#         self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.ReLU())
-#         self.fc_mu = nn.Linear(256*8*8, latent_dim)
-#         self.fc_log_var = nn.Linear(256*8*8, latent_dim)
+#         self.compression_rate = compression_rate
+#         self.image_size = image_size // compression_rate  # Calculate the compressed image size
+#         self.latent_dim = latent_dim
+#         # Assume a simple architecture; adjust based on your specific needs
+#         self.features = nn.Sequential(
+#             nn.Conv2d(input_channels, 32, 3, stride=2, padding=1),
+#             nn.ReLU(),
+#             nn.Conv2d(32, 64, 3, stride=2, padding=1),
+#             nn.ReLU(),
+#         )
+#         compressed_size = image_size // (2**self.compression_rate)  # Adjust based on your network's actual compression
+        
+#         self.fc_mu = nn.Linear(64 * compressed_size * compressed_size, latent_dim)
+#         self.fc_log_var = nn.Linear(64 * compressed_size * compressed_size, latent_dim)
 
-#     def forward(self, x):
-#         x = self.conv1(x)
-#         x = self.conv2(x)
-#         x = self.conv3(x)
-#         x = self.conv4(x)
-#         x = x.view(x.size(0), -1)
+#     def forward(self, x_orig):
+#         x_feat = self.features(x_orig)
+#         x = x_feat.view(x_feat.size(0), -1)
 #         mu = self.fc_mu(x)
 #         log_var = self.fc_log_var(x)
 #         return mu, log_var
 
 # class Decoder(nn.Module):
-#     def __init__(self, output_channels=3, latent_dim=2):  # Change for 2D latent space
+#     def __init__(self, output_channels, image_size, compression_rate, latent_dim):
 #         super().__init__()
-#         self.fc = nn.Linear(latent_dim, 256*8*8)
-#         self.deconv1 = nn.Sequential(nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU())
-#         self.deconv2 = nn.Sequential(nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU())
-#         self.deconv3 = nn.Sequential(nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU())
-#         self.deconv4 = nn.ConvTranspose2d(32, output_channels, 4, 2, 1)
+#         self.image_size = image_size // compression_rate
+#         self.latent_dim = latent_dim
+#         # Adjust the architecture to match the encoder's inverted process
+#         self.fc = nn.Linear(latent_dim, 64 * (self.image_size // 4) * (self.image_size // 4))
+#         self.features = nn.Sequential(
+#             nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+#             nn.ReLU(),
+#             nn.ConvTranspose2d(32, output_channels, 3, stride=2, padding=1, output_padding=1),
+#             nn.Sigmoid(),  # Assuming output in [0,1]
+#         )
 
 #     def forward(self, z):
 #         z = self.fc(z)
-#         z = z.view(-1, 256, 8, 8)
-#         z = self.deconv1(z)
-#         z = self.deconv2(z)
-#         z = self.deconv3(z)
-#         z = torch.sigmoid(self.deconv4(z))  # Assuming images are normalized to [0,1]
+#         z = z.view(-1, 64, self.image_size // 4, self.image_size // 4)
+#         z = self.features(z)
 #         return z
 
 # class VAE(LightningModule):
-    def __init__(self, input_channels=3, latent_dim=2, learning_rate=1e-3):  # Change for 2D latent space
-        super().__init__()
-        self.encoder = Encoder(input_channels, latent_dim)
-        self.decoder = Decoder(input_channels, latent_dim)
-        self.latent_dim = latent_dim
-        self.learning_rate = learning_rate
-        self.vgg = vgg16(pretrained=True).features[:11].eval()  # For perceptual loss, uses up to ReLU3_1
-        for param in self.vgg.parameters():
-            param.requires_grad = False
+#     def __init__(self, args):
+#         super().__init__()
+#         self.input_channels = args.input_channels
+#         self.image_size = args.image_size
+#         self.latent_dim = args.latent_dim
+#         self.compression_rate = args.compression_rate
+#         self.learning_rate = args.learning_rate
+        
+#         self.encoder = Encoder(self.input_channels, self.image_size, self.compression_rate, self.latent_dim)
+#         self.decoder = Decoder(self.input_channels, self.image_size, self.compression_rate, self.latent_dim)
+#         # Initialize the VGG16 model for perceptual loss
+#         self.vgg = vgg16(pretrained=True).features[:11].eval()
+#         for param in self.vgg.parameters():
+#             param.requires_grad = False
 
-    def forward(self, x):
-        mu, log_var = self.encoder(x)
-        z = self.reparameterize(mu, log_var)
-        return self.decoder(z), mu, log_var
+#     def forward(self, x):
+#         mu, log_var = self.encoder(x)
+#         z = self.reparameterize(mu, log_var)
+#         return self.decoder(z), mu, log_var
 
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+#     def reparameterize(self, mu, log_var):
+#         std = torch.exp(0.5 * log_var)
+#         eps = torch.randn_like(std)
+#         return mu + eps * std
 
-    def perceptual_loss(self, recon_x, x):
-        vgg_recon = self.vgg(recon_x)
-        vgg_x = self.vgg(x)
-        return F.mse_loss(vgg_recon, vgg_x)
+#     def perceptual_loss(self, recon_x, x):
+#         recon_features = self.vgg(recon_x)
+#         original_features = self.vgg(x)
+#         return F.mse_loss(recon_features, original_features)
 
-    def training_step(self, batch, batch_idx):
-        x, _ = batch
-        recon_x, mu, log_var = self.forward(x)
-        recon_loss = F.mse_loss(recon_x, x, reduction="mean")
-        perceptual_loss = self.perceptual_loss(recon_x, x)  # Perceptual loss component
-        kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        loss = recon_loss + kld_loss + perceptual_loss
-        self.log_dict({"train_loss": loss, "recon_loss": recon_loss, "kld_loss": kld_loss, "perceptual_loss": perceptual_loss}, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+#     def training_step(self, batch, batch_idx):
+#         x = batch['images']
+#         recon_x, mu, log_var = self.forward(x)
+#         recon_loss = F.mse_loss(recon_x, x, reduction="mean")
+#         kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+#         perceptual_loss = self.perceptual_loss(recon_x, x)
+#         loss = recon_loss + kld_loss + perceptual_loss
+#         self.log("train_kld_loss", kld_loss)
+#         self.log("train_perceptual_loss", perceptual_loss)
+#         self.log("train_recon_loss", recon_loss)
+#         self.log("train_loss", loss)
+#         return loss
 
-    def validation_step(self, batch, batch_idx):
-        x, _ = batch
-        recon_x, mu, log_var = self.forward(x)
-        recon_loss = F.mse_loss(recon_x, x, reduction="mean")
-        perceptual_loss = self.perceptual_loss(recon_x, x)
-        kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        loss = recon_loss + kld_loss + perceptual_loss
-        self.log_dict({"val_loss": loss, "val_recon_loss": recon_loss, "val_kld_loss": kld_loss, "val_perceptual_loss": perceptual_loss}, on_step=False, on_epoch=True, prog_bar=True)
+#     def validation_step(self, batch, batch_idx):
+#         x, _ = batch
+#         recon_x, mu, log_var = self.forward(x)
+#         recon_loss = F.mse_loss(recon_x, x, reduction="mean")
+#         kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+#         perceptual_loss = self.perceptual_loss(recon_x, x)
+#         loss = recon_loss + kld_loss + perceptual_loss
+#         self.log("val_kld_loss", kld_loss)
+#         self.log("val_perceptual_loss", perceptual_loss)
+#         self.log("val_recon_loss", recon_loss)
+#         self.log("val_loss", loss)
+#         return loss
 
-    def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.learning_rate)
+#     def configure_optimizers(self):
+#         return Adam(self.parameters(), lr=self.learning_rate)
+    
+# =======================
+# Stable Diffusion VAE
+# =======================
+# class AutoencoderKL(pl.LightningModule):
+#     def __init__(self,
+#                  ddconfig,
+#                  lossconfig,
+#                  embed_dim,
+#                  ckpt_path=None,
+#                  ignore_keys=[],
+#                  image_key="image",
+#                  colorize_nlabels=None,
+#                  monitor=None,
+#                  ema_decay=None,
+#                  learn_logvar=False
+#                  ):
+#         super().__init__()
+#         self.learn_logvar = learn_logvar
+#         self.image_key = image_key
+#         self.encoder = Encoder(**ddconfig)
+#         self.decoder = Decoder(**ddconfig)
+#         self.loss = instantiate_from_config(lossconfig)
+#         assert ddconfig["double_z"]
+#         self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
+#         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+#         self.embed_dim = embed_dim
+#         if colorize_nlabels is not None:
+#             assert type(colorize_nlabels)==int
+#             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
+#         if monitor is not None:
+#             self.monitor = monitor
+
+#         self.use_ema = ema_decay is not None
+#         if self.use_ema:
+#             self.ema_decay = ema_decay
+#             assert 0. < ema_decay < 1.
+#             self.model_ema = LitEma(self, decay=ema_decay)
+#             print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+
+#         if ckpt_path is not None:
+#             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+#     def init_from_ckpt(self, path, ignore_keys=list()):
+#         sd = torch.load(path, map_location="cpu")["state_dict"]
+#         keys = list(sd.keys())
+#         for k in keys:
+#             for ik in ignore_keys:
+#                 if k.startswith(ik):
+#                     print("Deleting key {} from state_dict.".format(k))
+#                     del sd[k]
+#         self.load_state_dict(sd, strict=False)
+#         print(f"Restored from {path}")
+
+#     @contextmanager
+#     def ema_scope(self, context=None):
+#         if self.use_ema:
+#             self.model_ema.store(self.parameters())
+#             self.model_ema.copy_to(self)
+#             if context is not None:
+#                 print(f"{context}: Switched to EMA weights")
+#         try:
+#             yield None
+#         finally:
+#             if self.use_ema:
+#                 self.model_ema.restore(self.parameters())
+#                 if context is not None:
+#                     print(f"{context}: Restored training weights")
+
+#     def on_train_batch_end(self, *args, **kwargs):
+#         if self.use_ema:
+#             self.model_ema(self)
+
+#     def encode(self, x):
+#         h = self.encoder(x)
+#         moments = self.quant_conv(h)
+#         posterior = DiagonalGaussianDistribution(moments)
+#         return posterior
+
+#     def decode(self, z):
+#         z = self.post_quant_conv(z)
+#         dec = self.decoder(z)
+#         return dec
+
+#     def forward(self, input, sample_posterior=True):
+#         posterior = self.encode(input)
+#         if sample_posterior:
+#             z = posterior.sample()
+#         else:
+#             z = posterior.mode()
+#         dec = self.decode(z)
+#         return dec, posterior
+
+#     def get_input(self, batch, k):
+#         x = batch[k]
+#         if len(x.shape) == 3:
+#             x = x[..., None]
+#         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+#         return x
+
+#     def training_step(self, batch, batch_idx, optimizer_idx):
+#         inputs = self.get_input(batch, self.image_key)
+#         reconstructions, posterior = self(inputs)
+
+#         if optimizer_idx == 0:
+#             # train encoder+decoder+logvar
+#             aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
+#                                             last_layer=self.get_last_layer(), split="train")
+#             self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+#             self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+#             return aeloss
+
+#         if optimizer_idx == 1:
+#             # train the discriminator
+#             discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
+#                                                 last_layer=self.get_last_layer(), split="train")
+
+#             self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+#             self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+#             return discloss
+
+#     def validation_step(self, batch, batch_idx):
+#         log_dict = self._validation_step(batch, batch_idx)
+#         with self.ema_scope():
+#             log_dict_ema = self._validation_step(batch, batch_idx, postfix="_ema")
+#         return log_dict
+
+#     def _validation_step(self, batch, batch_idx, postfix=""):
+#         inputs = self.get_input(batch, self.image_key)
+#         reconstructions, posterior = self(inputs)
+#         aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
+#                                         last_layer=self.get_last_layer(), split="val"+postfix)
+
+#         discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
+#                                             last_layer=self.get_last_layer(), split="val"+postfix)
+
+#         self.log(f"val{postfix}/rec_loss", log_dict_ae[f"val{postfix}/rec_loss"])
+#         self.log_dict(log_dict_ae)
+#         self.log_dict(log_dict_disc)
+#         return self.log_dict
+
+#     def configure_optimizers(self):
+#         lr = self.learning_rate
+#         ae_params_list = list(self.encoder.parameters()) + list(self.decoder.parameters()) + list(
+#             self.quant_conv.parameters()) + list(self.post_quant_conv.parameters())
+#         if self.learn_logvar:
+#             print(f"{self.__class__.__name__}: Learning logvar")
+#             ae_params_list.append(self.loss.logvar)
+#         opt_ae = torch.optim.Adam(ae_params_list,
+#                                   lr=lr, betas=(0.5, 0.9))
+#         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+#                                     lr=lr, betas=(0.5, 0.9))
+#         return [opt_ae, opt_disc], []
+
+#     def get_last_layer(self):
+#         return self.decoder.conv_out.weight
+
+#     @torch.no_grad()
+#     def log_images(self, batch, only_inputs=False, log_ema=False, **kwargs):
+#         log = dict()
+#         x = self.get_input(batch, self.image_key)
+#         x = x.to(self.device)
+#         if not only_inputs:
+#             xrec, posterior = self(x)
+#             if x.shape[1] > 3:
+#                 # colorize with random projection
+#                 assert xrec.shape[1] > 3
+#                 x = self.to_rgb(x)
+#                 xrec = self.to_rgb(xrec)
+#             log["samples"] = self.decode(torch.randn_like(posterior.sample()))
+#             log["reconstructions"] = xrec
+#             if log_ema or self.use_ema:
+#                 with self.ema_scope():
+#                     xrec_ema, posterior_ema = self(x)
+#                     if x.shape[1] > 3:
+#                         # colorize with random projection
+#                         assert xrec_ema.shape[1] > 3
+#                         xrec_ema = self.to_rgb(xrec_ema)
+#                     log["samples_ema"] = self.decode(torch.randn_like(posterior_ema.sample()))
+#                     log["reconstructions_ema"] = xrec_ema
+#         log["inputs"] = x
+#         return log
+
+#     def to_rgb(self, x):
+#         assert self.image_key == "segmentation"
+#         if not hasattr(self, "colorize"):
+#             self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
+#         x = F.conv2d(x, weight=self.colorize)
+#         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
+#         return x

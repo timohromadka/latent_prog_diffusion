@@ -35,14 +35,13 @@ def load_hf_dataset(path_or_reponame: str, **kwargs):
 
 
 class ImageDatasets(LightningDataModule):
-
-    def __init__(self, cfg_data: DictConfig) -> None:
+    def __init__(self, args) -> None:
         super().__init__()
 
-        self.batch_size = cfg_data.batch_size
-        self.data_dir = cfg_data.data_dir
-        self.image_resolution = cfg_data.image_resolution
-        self.HF_DATASET_IMAGE_KEY = cfg_data.HF_DATASET_IMAGE_KEY
+        self.batch_size = args.batch_size
+        self.data_dir = args.dataset
+        self.image_resolution = args.image_resolution
+        self.HF_DATASET_IMAGE_KEY = args.HF_DATASET_IMAGE_KEY
 
         # Preprocessing the datasets and DataLoaders creation.
         self.augmentations = Compose(
