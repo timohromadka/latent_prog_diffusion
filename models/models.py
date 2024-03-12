@@ -42,23 +42,6 @@ logger = logging.getLogger('models/models.py')
 torch.set_float32_matmul_precision('medium')
 to_tensor = transforms.ToTensor()
 
-def generate_images_from_latent_codes(model, device, num_samples=10, image_size=32, save_path="generated_images.png"):
-    # Assuming your latent space size is the same as the CIFAR10 images you trained on
-    latent_dims = (image_size // (2 ** model.num_downsampling_layers)) ** 2  # Adjust based on your architecture's downsampling
-    # Sample random latent codes
-    sampled_latent_codes = torch.randint(0, model.vq.num_embeddings, (num_samples, latent_dims)).to(device)
-    # Convert latent codes to one-hot embeddings
-    one_hot = torch.nn.functional.one_hot(sampled_latent_codes, num_classes=model.vq.num_embeddings).float()
-    # Reshape to match the decoder input
-    one_hot = one_hot.permute(0, 3, 1, 2).reshape(num_samples, model.embedding_dim, image_size // (2 ** model.num_downsampling_layers), image_size // (2 ** model.num_downsampling_layers))
-    # Decode images
-    with torch.no_grad():
-        generated_images = model.decoder(one_hot)
-    # Normalize and save images
-    generated_images = (generated_images + 1) / 2  # Assuming your model output is in [-1, 1]
-    save_image(generated_images, save_path, nrow=int(num_samples ** 0.5), normalize=True)
-
-
 def get_model(args: argparse.Namespace):
     if args.model_to_load is None:
         if args.model in ['diffusion', 'latent_diffusion']:
@@ -121,20 +104,28 @@ def load_model_from_run_name(args):
   
   
 class VQVAELightning(LightningModule):
-    def __init__(self, args, lr=3e-4):
+    def __init__(self, args):
         super().__init__()
         self.save_hyperparameters()  # Save initialization arguments to log them with TensorBoard or access them later.
-        
+        self.args = args
         # Model setup
         self.model = VQVAE(args)
+        self.num_fid_samples = args.num_fid_samples
         self.criterion = torch.nn.MSELoss()
         self.beta = args.beta
-        self.lr = lr  # Using the passed lr argument or default value.
+        self.lr = args.learning_rate 
 
         # Metrics
         self.metrics = MetricCollection({
             "mse": MeanSquaredError(),
         })
+        self.fid = FrechetInceptionDistance(
+            normalize=True, reset_real_features=False)
+        self.fid.persistent(mode=True)
+        self.fid.requires_grad_(False)
+        
+        # Storing of images
+        self.stored_real_images = None
 
     def forward(self, x):
         return self.model(x)
@@ -149,6 +140,22 @@ class VQVAELightning(LightningModule):
         total_loss = recon_error + commitment_loss + dictionary_loss
         return total_loss, recon_error, commitment_loss, dictionary_loss
 
+    def record_data_for_FID(self, batch, real: bool):
+        # batch must be either list of PIL Images, ..
+        # .. or, a Tensor of shape (BxCxHxW)
+        if isinstance(batch, list):
+            batch = torch.stack([to_tensor(pil_image)
+                              for pil_image in batch], 0)
+        self.fid.update(batch.to(dtype=self.dtype, device=self.device),
+                         real=real)
+
+    def record_fake_data_for_FID(self, batch):
+        self.record_data_for_FID(batch, False)
+
+    def record_real_data_for_FID(self, batch, batch_idx):
+        if self.training and self.current_epoch == 0 and batch_idx < 31:
+            self.record_data_for_FID(batch, True)
+        
     def training_step(self, batch, batch_idx):
         total_loss, recon_error, commitment_loss, dictionary_loss = self.step(batch)
         
@@ -163,6 +170,16 @@ class VQVAELightning(LightningModule):
     def validation_step(self, batch, batch_idx):
         total_loss, recon_error, commitment_loss, dictionary_loss = self.step(batch)
         
+        clean_images = batch['images']
+        if self.args.calculate_fid:
+            logger.info('')
+            # Record real images during the first epoch and for the first num_fid_validation_steps steps
+            if self.current_epoch == 0 and batch_idx < (self.args.num_fid_samples/self.args.batch_size):
+                if self.stored_real_images is None:
+                    self.stored_real_images = clean_images
+                else:
+                    self.stored_real_images = torch.cat((self.stored_real_images, clean_images), 0)
+            
         # Log individual losses
         self.log('val_recon_error', recon_error)
         self.log('val_commitment_loss', commitment_loss)
@@ -174,6 +191,54 @@ class VQVAELightning(LightningModule):
     def configure_optimizers(self):
         optimizer = Adam(self.parameters(), lr=self.lr)
         return optimizer
+    
+
+    def generate_images_from_latent_codes(self, num_samples):
+        self.model.eval()
+        with torch.no_grad():
+            # Sample latent codes
+            latent_h = self.args.image_size // (2 ** self.model.num_downsampling_layers)
+            latent_w = self.args.image_size // (2 ** self.model.num_downsampling_layers)
+            sampled_latent_codes = torch.randint(0, self.model.vq.num_embeddings, (num_samples, latent_h, latent_w), device=self.device)
+            
+            # Directly use the sampled indices to retrieve embeddings from the codebook
+            quantized = F.embedding(sampled_latent_codes, self.model.vq.e_i_ts.permute(1, 0))
+            quantized = quantized.permute(0, 3, 1, 2)  # Ensure the shape is [batch_size, embedding_dim, H, W]
+
+            # Decode the embeddings to generate images
+            generated_images = self.model.decoder(quantized)
+            
+        self.model.train()
+        return (generated_images + 1) / 2  # Normalize images to [0, 1]
+
+    def calculate_and_log_fid(self, real_images, num_samples):
+        # Generate fake images
+        fake_images = self.generate_images_from_latent_codes(num_samples=num_samples)
+        
+        # Update FID with real and fake images
+        self.fid.update(real_images, real=True)
+        self.fid.update(fake_images, real=False)
+
+        # Compute FID
+        fid_score = self.fid.compute()
+        self.fid.reset()  # Reset FID state for the next calculation
+        
+        # Log FID score
+        self.log('fid', fid_score, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+    def on_validation_epoch_end(self):
+        if self.args.calculate_fid:
+            # Generate fake images
+            fake_images = self.generate_images_from_latent_codes(num_samples=self.num_fid_samples)
+            
+            if self.stored_real_images is not None:
+                self.fid.update(self.stored_real_images, real=True)
+                self.fid.update(fake_images, real=False)
+                
+                fid_score = self.fid.compute()
+                self.log('fid', fid_score, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+                self.fid.reset()
 
 class Diffusion(LightningModule):
     def __init__(self, args: argparse.Namespace):

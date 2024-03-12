@@ -65,8 +65,8 @@ def main():
             callbacks.LearningRateMonitor(logging_interval='epoch', log_momentum=True),
             PipelineCheckpoint(mode='min', monitor='FID'),  # Assuming FID needs to be monitored separately
             callbacks.RichProgressBar(),
-            model_checkpoint_callback,  # Add checkpoint callback
-            early_stopping_callback,  # Add early stopping callback
+            model_checkpoint_callback, 
+            early_stopping_callback,
         ],
         num_sanity_val_steps=args.num_sanity_val_steps,
         benchmark=args.benchmark,
