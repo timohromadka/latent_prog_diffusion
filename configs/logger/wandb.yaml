@@ -6,4 +6,4 @@ settings:
   _target_: wandb.Settings
   _disable_stats: true
   _disable_meta: true
-offline: false
+offline: true
