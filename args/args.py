@@ -7,9 +7,7 @@ parser = argparse.ArgumentParser(description="Training arguments for latent prog
 
 # Data arguments
 parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset and also its data directory', choices=['cifar10', 'mnist', '2d'])
-parser.add_argument('--HF_DATASET_IMAGE_KEY', type=str, default='img', help='Image key in HF dataset')
 parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
-parser.add_argument('--image_resolution', type=int, default=32, help='Image resolution for models')
 
 # Training arguments
 parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
@@ -27,9 +25,11 @@ parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning 
 parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate. -1 to disable EMA')
 parser.add_argument('--monitor', type=str, default='val_total_loss', help='Specify the metric to be monitored for early stopping and model checkpoint callbacks.')
 parser.add_argument('--checkpoint_dir', type=str, default='checkpoint_dir', help='Specify the checkpoint directory.')
-parser.add_argument('--patience', type=int, default=0, help='Number of epochs to wait after metric stops improving.')
-parser.add_argument('--num_train_samples', type=int, default=100, help='Specify amount of training samples to use in the training set.')
-parser.add_argument('--num_val_samples', type=int, default=20, help='Specify amount of validation samples to use in the validation set.')
+parser.add_argument('--patience', type=int, default=1, help='Number of epochs to wait after metric stops improving.')
+parser.add_argument('--num_train_samples', type=int, default=None, help='Specify amount of training samples to use in the training set. If None, the entire dataset is used.')
+parser.add_argument('--num_val_samples', type=int, default=None, help='Specify amount of validation samples to use in the validation set. If None, the entire dataset is used.')
+parser.add_argument('--save_top_k', type=int, default=1, help='Specify how many top omdels to saved, according to --monitor metric.')
+
 
 # Model arguments
 parser.add_argument('--model', type=str, default='diffusion', choices=['diffusion', 'latent_diffusion', 'vae'], help='Select which type of model this training run will be for. This in turns specifies the nature/setup of the experiment.')
@@ -95,16 +95,22 @@ def apply_subset_arguments(args):
     if args.dataset == "cifar10":
         args.image_size = 32 
         args.input_channels = 3
+        args.convert_to_rgb = True
+        args.HF_DATASET_IMAGE_KEY = 'img'
     elif args.dataset == "mnist":
         args.image_size = 28
         args.input_channels = 1
+        args.HF_DATASET_IMAGE_KEY = 'image'
+        args.convert_to_rgb = False
     elif args.dataset == "2d":
         args.image_size = 2
         args.input_channels = 1
+        args.HF_DATASET_IMAGE_KEY = None
+        args.convert_to_rgb = False
     else:
         raise ValueError(f'Invalid dataset specified: {args.dataset}')
     
-    if 'loss' in args.monitor:
+    if 'loss' in args.monitor or args.monitor == 'fid':
         args.mode = 'min'
     else:
         args.mode = 'max'
