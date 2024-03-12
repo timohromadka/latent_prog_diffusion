@@ -1,6 +1,6 @@
 import hydra as hy
 from omegaconf import DictConfig, OmegaConf
-
+import os
 
 import torch
 from torchvision import transforms, utils as tv_utils
@@ -40,11 +40,11 @@ def main():
     )
 
     model_checkpoint_callback = callbacks.ModelCheckpoint(
-        monitor=args.monitor,  # Metric to monitor
-        mode=args.mode,  # 'min' if the metric should decrease, 'max' if it should increase
-        save_top_k=3,  # Number of top models to save
-        dirpath=args.checkpoint_dir,  # Directory to save the models
-        filename='{epoch}-{step}-{val_loss:.2f}',  # Filename pattern
+        monitor=args.monitor, 
+        mode=args.mode, 
+        save_top_k=args.save_top_k,
+        dirpath=os.path.join(args.checkpoint_dir, args.wandb_run_name), 
+        filename='{epoch}-{step}-{fid:.6f}',
     )
 
     early_stopping_callback = callbacks.EarlyStopping(
@@ -63,7 +63,7 @@ def main():
         logger=wandb_logger,
         callbacks=[
             callbacks.LearningRateMonitor(logging_interval='epoch', log_momentum=True),
-            PipelineCheckpoint(mode='min', monitor='FID'),  # Assuming FID needs to be monitored separately
+            # PipelineCheckpoint(mode='min', monitor='fid'),  # Assuming FID needs to be monitored separately
             callbacks.RichProgressBar(),
             model_checkpoint_callback, 
             early_stopping_callback,
