@@ -7,7 +7,7 @@ from datasets import (
     DatasetDict,
     Dataset
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from torchvision.transforms import (
     CenterCrop,
@@ -42,6 +42,8 @@ class ImageDatasets(LightningDataModule):
         self.data_dir = args.dataset
         self.image_resolution = args.image_resolution
         self.HF_DATASET_IMAGE_KEY = args.HF_DATASET_IMAGE_KEY
+        self.num_train_samples = args.num_train_samples
+        self.num_val_samples = args.num_val_samples
 
         # Preprocessing the datasets and DataLoaders creation.
         self.augmentations = Compose(
@@ -66,6 +68,12 @@ class ImageDatasets(LightningDataModule):
         elif isinstance(dataset, Dataset):
             split_datasets = dataset.train_test_split(0.1, 0.9, seed=42)
             self.train_dataset, self.valid_dataset = split_datasets['train'], split_datasets['test']
+
+        # Subset selection if specified
+        if self.num_train_samples is not None:
+            self.train_dataset = Subset(self.train_dataset, range(self.num_train_samples))
+        if self.num_val_samples is not None:
+            self.valid_dataset = Subset(self.valid_dataset, range(self.num_val_samples))
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset,
