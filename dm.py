@@ -40,17 +40,18 @@ class ImageDatasets(LightningDataModule):
 
         self.batch_size = args.batch_size
         self.data_dir = args.dataset
-        self.image_resolution = args.image_resolution
+        self.image_size = args.image_size
         self.HF_DATASET_IMAGE_KEY = args.HF_DATASET_IMAGE_KEY
+        self.convert_to_rgb = args.convert_to_rgb
         self.num_train_samples = args.num_train_samples
         self.num_val_samples = args.num_val_samples
 
         # Preprocessing the datasets and DataLoaders creation.
         self.augmentations = Compose(
             [
-                Resize(self.image_resolution,
+                Resize(self.image_size,
                        interpolation=InterpolationMode.BILINEAR),
-                CenterCrop(self.image_resolution),
+                CenterCrop(self.image_size),
                 RandomHorizontalFlip(),
                 ToTensor(),
                 Normalize([0.5], [0.5]),
@@ -94,8 +95,14 @@ class ImageDatasets(LightningDataModule):
                           )
 
     def _transforms(self, sample):
-        images = [
-            self.augmentations(image.convert("RGB"))
-            for image in sample[self.HF_DATASET_IMAGE_KEY]
-        ]
+        """
+        Although MNIST is not directly meant to be calculated with FID, we simply copy
+        the channel 3 times to get a 3 channel
+        
+        As advised here: https://stackoverflow.com/questions/57183647/frechet-inception-distance-for-dc-gan-trained-on-mnist-dataset
+        """
+        
+        images = []
+        for image in sample[self.HF_DATASET_IMAGE_KEY]:
+            images.append(self.augmentations(image.convert("RGB")))
         return {"images": images}
