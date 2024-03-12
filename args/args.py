@@ -21,14 +21,15 @@ parser.add_argument('--num_sanity_val_steps', type=int, default=0, help='Number 
 parser.add_argument('--max_epochs', type=int, default=20, help='Maximum number of training epochs')
 parser.add_argument('--enable_model_summary', action='store_true', help='Enable model summary')
 parser.add_argument('--log_every_n_steps', type=int, default=10, help='Log metrics every n steps')
-parser.add_argument('--check_val_every_n_epoch', type=int, default=10, help='Check validation set every n epochs')
+parser.add_argument('--check_val_every_n_epoch', type=int, default=1, help='Check validation set every n epochs')
 parser.add_argument('--devices', type=str, default='-1', help='Devices for training')
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
 parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate. -1 to disable EMA')
-parser.add_argument('--monitor', type=str, default='train_total_loss', help='Specify the metric to be monitored for early stopping and model checkpoint callbacks.')
+parser.add_argument('--monitor', type=str, default='val_total_loss', help='Specify the metric to be monitored for early stopping and model checkpoint callbacks.')
 parser.add_argument('--checkpoint_dir', type=str, default='checkpoint_dir', help='Specify the checkpoint directory.')
 parser.add_argument('--patience', type=int, default=0, help='Number of epochs to wait after metric stops improving.')
-
+parser.add_argument('--num_train_samples', type=int, default=100, help='Specify amount of training samples to use in the training set.')
+parser.add_argument('--num_val_samples', type=int, default=20, help='Specify amount of validation samples to use in the validation set.')
 
 # Model arguments
 parser.add_argument('--model', type=str, default='diffusion', choices=['diffusion', 'latent_diffusion', 'vae'], help='Select which type of model this training run will be for. This in turns specifies the nature/setup of the experiment.')
@@ -70,8 +71,10 @@ parser.add_argument('--timestep_spacing', type=str, default='trailing', help='Ti
 parser.add_argument('--steps_offset', type=int, default=0, help='Steps offset for the scheduler')
 parser.add_argument('--rescale_betas_zero_snr', action='store_true', help='Rescale betas to zero SNR')
 
-# Inference Arguments
+# FID Arguments
 parser.add_argument('--num_fid_samples', type=int, default=1024, help='Steps offset for the scheduler')
+parser.add_argument('--calculate_fid', action='store_true')
+
 
 # VAE-specific arguments
 parser.add_argument('--latent_dim', type=int, default=2, choices=[1,2], help='Number of latent dimensions, either 1 or 2')
