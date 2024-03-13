@@ -125,6 +125,7 @@ class Decoder(nn.Module):
         num_upsampling_layers,
         num_residual_layers,
         num_residual_hiddens,
+        final_num_channels
     ):
         super().__init__()
         # See Section 4.1 of "Neural Discrete Representation Learning".
@@ -146,7 +147,7 @@ class Decoder(nn.Module):
                 (in_channels, out_channels) = (num_hiddens, num_hiddens // 2)
 
             else:
-                (in_channels, out_channels) = (num_hiddens // 2, 3)
+                (in_channels, out_channels) = (num_hiddens // 2, final_num_channels)
 
             upconv.add_module(
                 f"up{upsampling_layer}",
@@ -313,6 +314,7 @@ class VQVAE(nn.Module):
             self.num_downsampling_layers,
             self.num_residual_layers,
             self.num_residual_hiddens,
+            self.in_channels
         )
 
     def quantize(self, x):
