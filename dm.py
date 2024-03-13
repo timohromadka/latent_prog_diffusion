@@ -104,5 +104,8 @@ class ImageDatasets(LightningDataModule):
         
         images = []
         for image in sample[self.HF_DATASET_IMAGE_KEY]:
-            images.append(self.augmentations(image.convert("RGB")))
+            if self.convert_to_rgb:
+                images.append(self.augmentations(image.convert("RGB")))
+            else:
+                images.append(self.augmentations(image))
         return {"images": images}
