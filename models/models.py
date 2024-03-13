@@ -47,12 +47,19 @@ logger = logging.getLogger('models/models.py')
 torch.set_float32_matmul_precision('medium')
 to_tensor = transforms.ToTensor()
 
+def convert_to_rgb(batch):
+    if batch.shape[1] == 1: # i.e. single channel image
+        batch = batch.repeat(1, 3, 1, 1)  # repeat the channel 3 times
+    return batch
+
 def get_model(args: argparse.Namespace):
     if args.model_to_load is None:
         if args.model in ['diffusion', 'latent_diffusion']:
             return Diffusion(args)
-        elif args.model == 'vae':
+        elif args.model == 'vqvae':
             return VQVAELightning(args)
+        elif args.model == 'vae':
+            return VAELightning(args)
     else:
         load_model_from_run_name(args)
         
@@ -129,8 +136,6 @@ class VQVAELightning(LightningModule):
         self.fid.persistent(mode=True)
         self.fid.requires_grad_(False)
         
-        # Storing of images
-        self.stored_real_images = None
 
     def forward(self, x):
         return self.model(x)
@@ -154,13 +159,6 @@ class VQVAELightning(LightningModule):
         self.fid.update(batch.to(dtype=self.dtype, device=self.device),
                          real=real)
 
-    def record_fake_data_for_FID(self, batch):
-        self.record_data_for_FID(batch, False)
-
-    def record_real_data_for_FID(self, batch, batch_idx):
-        if self.training and self.current_epoch == 0 and batch_idx < 31:
-            self.record_data_for_FID(batch, True)
-        
     def training_step(self, batch, batch_idx):
         total_loss, recon_error, commitment_loss, dictionary_loss = self.step(batch)
         
@@ -179,13 +177,10 @@ class VQVAELightning(LightningModule):
         if self.args.calculate_fid:
             # Record real images during the first epoch and for the first num_fid_validation_steps steps
             if self.current_epoch == 0 and batch_idx < (self.args.num_fid_samples/self.args.batch_size):
-                # if self.stored_real_images is None:
-                #     self.stored_real_images = clean_images
-                # else:
-                #     self.stored_real_images = torch.cat((self.stored_real_images, clean_images), 0)
-                # # update after each batch
-                # self.fid.update(self.stored_real_images, real=True)
-                self.fid.update(clean_images, real=True)
+                if self.args.dataset == 'mnist':
+                    clean_images = convert_to_rgb(clean_images)
+                self.record_data_for_FID(clean_images, real=True)
+                #self.fid.update(clean_images, real=True)
             
         # Log individual losses
         self.log('val_recon_error', recon_error)
@@ -226,6 +221,132 @@ class VQVAELightning(LightningModule):
             #for _ in tqdm(range(total_batches), desc=f'Generarating {self.args.num_fid_samples} "fake" samples for FID calculation.'):
             for _ in range(total_batches):
                 fake_images = self.generate_images_from_latent_codes(num_samples=self.args.batch_size)
+                if self.args.dataset == 'mnist':
+                    fake_images = convert_to_rgb(fake_images)
+                #self.fid.update(fake_images, real=False)
+                self.record_data_for_FID(fake_images, real=False)
+                
+            logger.info('Calculating FID score!')
+            fid_score = self.fid.compute()
+            self.log('fid', fid_score, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+            self.fid.reset()
+            logger.info('Done!')
+      
+      
+# ==================
+# VAE
+# ==================      
+class Encoder(nn.Module):
+    def __init__(self, input_channels, latent_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(input_channels, 64, 4, stride=2, padding=1) # Assuming input size is 32x32
+        self.conv2 = nn.Conv2d(64, 128, 4, stride=2, padding=1)
+        self.fc_mu = nn.Linear(128 * 8 * 8, latent_dim)
+        self.fc_var = nn.Linear(128 * 8 * 8, latent_dim)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = torch.flatten(x, start_dim=1)
+        mu = self.fc_mu(x)
+        log_var = self.fc_var(x)
+        return mu, log_var
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim, output_channels):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, 128 * 8 * 8)
+        self.conv2 = nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1)
+        self.conv1 = nn.ConvTranspose2d(64, output_channels, 4, stride=2, padding=1)
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = x.view(-1, 128, 8, 8)
+        x = F.relu(self.conv2(x))
+        x = torch.sigmoid(self.conv1(x))  # Assuming the input & output are normalized to [0,1]
+        return x
+
+class VAELightning(LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.encoder = Encoder(args.input_channels, args.latent_dim)
+        self.decoder = Decoder(args.latent_dim, args.input_channels)
+        self.criterion = nn.MSELoss()
+        self.metric = MeanSquaredError()
+        
+        # Metrics
+        self.metrics = MetricCollection({
+            "mse": MeanSquaredError(),
+        })
+        self.fid = FrechetInceptionDistance(
+            normalize=True, reset_real_features=False)
+        self.fid.persistent(mode=True)
+        self.fid.requires_grad_(False)
+        
+    def generate_samples(self, n_samples):
+        self.eval()  # Ensure the model is in evaluation mode
+        with torch.no_grad():  # No need to track gradients
+            # Sample from a standard normal distribution
+            z = torch.randn(n_samples, self.args.latent_dim, device=self.device)
+            # Pass through the decoder
+            samples = self.decoder(z)
+        self.train()  # Set the model back to training mode
+        return samples
+
+    def forward(self, x):
+        mu, log_var = self.encoder(x)
+        p = torch.randn_like(mu)  # Standard normal distribution
+        z = mu + torch.exp(log_var / 2) * p  # Reparameterization trick
+        return self.decoder(z), mu, log_var
+
+    def step(self, batch):
+        x = batch['images']
+        recon, mu, log_var = self(x)
+        recon_loss = self.criterion(recon, x)
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        total_loss = recon_loss + self.args.beta * kld_loss
+        return total_loss, recon_loss, kld_loss
+
+    def training_step(self, batch, batch_idx):
+        total_loss, recon_loss, kld_loss = self.step(batch)
+        self.log('train_loss', total_loss)
+        self.log('train_recon_loss', recon_loss)
+        self.log('train_kld_loss', kld_loss)
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        total_loss, recon_loss, kld_loss = self.step(batch)
+        
+        clean_images = batch['images']
+        if self.args.calculate_fid:
+            # Record real images during the first epoch and for the first num_fid_validation_steps steps
+            if self.current_epoch == 0 and batch_idx < (self.args.num_fid_samples/self.args.batch_size):
+                if self.args.dataset == 'mnist':
+                    clean_images = convert_to_rgb(clean_images)
+                self.fid.update(clean_images, real=True)
+            
+            
+        self.log('val_loss', total_loss)
+        self.log('val_recon_loss', recon_loss)
+        self.log('val_kld_loss', kld_loss)
+        self.metric(recon_loss)
+        self.log('val_mse', self.metric, on_step=True, on_epoch=True, prog_bar=True)
+
+    def configure_optimizers(self):
+        return Adam(self.parameters(), lr=self.args.learning_rate)
+    
+    def on_validation_epoch_end(self):
+        if self.args.calculate_fid:
+            # Generate fake images
+            
+            total_batches = (self.num_fid_samples + self.args.batch_size - 1) // self.args.batch_size
+            #for _ in tqdm(range(total_batches), desc=f'Generarating {self.args.num_fid_samples} "fake" samples for FID calculation.'):
+            for _ in range(total_batches):
+                fake_images = self.generate_images_from_latent_codes(num_samples=self.args.batch_size)
+                if self.args.dataset == 'mnist':
+                    fake_images = convert_to_rgb(fake_images)
                 self.fid.update(fake_images, real=False)
                 
             logger.info('Calculating FID score!')
@@ -234,7 +355,10 @@ class VQVAELightning(LightningModule):
 
             self.fid.reset()
             logger.info('Done!')
-
+            
+# ==================
+# DIFFUSION
+# ==================
 class Diffusion(LightningModule):
     def __init__(self, args: argparse.Namespace):
         super().__init__()
@@ -284,7 +408,7 @@ class Diffusion(LightningModule):
     def _create_unet_model(self, model_size):
         if model_size == 'large':
             model = UNet2DModel(
-                sample_size=32,
+                sample_size=self.args.image_size,
                 in_channels=3,
                 out_channels=3,
                 center_input_sample=False,
